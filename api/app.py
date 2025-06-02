@@ -383,48 +383,45 @@ def process_report():
     if not es:
         return jsonify({'error': 'Elasticsearch not available'}), 503
 
-    try:
-        data = request.get_json(force=True)
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
+    # Robustly handle empty or invalid JSON
+    if not request.data or request.data.strip() == b'':
+        return jsonify({'error': 'No data provided'}), 400
+    data = request.get_json(silent=True)
+    if data is None:
+        return jsonify({'error': 'Invalid or empty JSON'}), 400
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
 
-        # Add processing metadata
-        data['@timestamp'] = datetime.utcnow().isoformat()
-        data['processed_by'] = 'dmarc-api'
-        data['processing_id'] = str(uuid.uuid4())
+    # Add processing metadata
+    data['@timestamp'] = datetime.utcnow().isoformat()
+    data['processed_by'] = 'dmarc-api'
+    data['processing_id'] = str(uuid.uuid4())
 
-        # Index the document
-        result = es.index(
-            index=f"{ES_INDEX_PREFIX}-{datetime.utcnow().strftime('%Y.%m.%d')}",
-            body=data
-        )
+    # Index the document
+    result = es.index(
+        index=f"{ES_INDEX_PREFIX}-{datetime.utcnow().strftime('%Y.%m.%d')}",
+        body=data
+    )
 
-        # Clear relevant caches
-        if redis_client:
-            keys = redis_client.keys("api:*")
-            if keys:
-                redis_client.delete(*keys)
+    # Clear relevant caches
+    if redis_client:
+        keys = redis_client.keys("api:*")
+        if keys:
+            redis_client.delete(*keys)
 
-        # Emit live update
-        emit_live_update('new_report', {
-            'id': result['_id'],
-            'org_name': data.get('org_name'),
-            'domain': data.get('policy_published', {}).get('domain'),
-            'timestamp': data['@timestamp']
-        })
+    # Emit live update
+    emit_live_update('new_report', {
+        'id': result['_id'],
+        'org_name': data.get('org_name'),
+        'domain': data.get('policy_published', {}).get('domain'),
+        'timestamp': data['@timestamp']
+    })
 
-        return jsonify({
-            'success': True,
-            'id': result['_id'],
-            'index': result['_index']
-        })
-
-    except BadRequest as e:
-        # Re-raise so the global error handler can catch it
-        raise
-    except Exception as e:
-        logger.error(f"Error processing report: {e}")
-        return jsonify({'error': str(e)}), 500
+    return jsonify({
+        'success': True,
+        'id': result['_id'],
+        'index': result['_index']
+    })
 
 @app.route('/api/search', methods=['POST'])
 def search_reports():
@@ -509,6 +506,19 @@ def internal_error(error):
 def handle_bad_request(error):
     logger.error(f"BadRequest: {error}")
     return jsonify({'error': 'Invalid or malformed JSON'}), 400
+
+@app.errorhandler(400)
+def handle_400_error(error):
+    logger.error(f"400 Error: {error}")
+    return jsonify({'error': 'Invalid or malformed JSON'}), 400
+
+@app.errorhandler(Exception)
+def handle_all_exceptions(error):
+    if isinstance(error, BadRequest) or getattr(error, 'code', None) == 400:
+        logger.error(f"Generic 400 handler: {error}")
+        return jsonify({'error': 'Invalid or malformed JSON'}), 400
+    logger.error(f"Unhandled Exception: {error}")
+    return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == '__main__':
     # Start background simulation
