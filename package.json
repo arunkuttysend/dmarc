@@ -1,0 +1,46 @@
+{
+  "name": "dmarc-analyzer",
+  "version": "1.0.0",
+  "description": "DMARC Report Analyzer with Elasticsearch and Kibana",
+  "main": "index.js",
+  "scripts": {
+    "start": "make start",
+    "stop": "make stop",
+    "restart": "make restart",
+    "logs": "make logs",
+    "status": "make status",
+    "health": "make health",
+    "setup": "./scripts/dev.sh setup",
+    "init": "./scripts/dev.sh init",
+    "test-api": "./scripts/test-api.sh",
+    "generate-data": "./scripts/generate-sample-data.sh",
+    "clean": "make clean",
+    "backup": "make backup"
+  },
+  "keywords": [
+    "dmarc",
+    "email-security",
+    "elasticsearch",
+    "kibana",
+    "parsedmarc",
+    "analytics",
+    "reporting"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "eslint": "^8.0.0",
+    "prettier": "^2.5.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/dmarc-analyzer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/dmarc-analyzer/issues"
+  },
+  "homepage": "https://github.com/yourusername/dmarc-analyzer#readme"
+}

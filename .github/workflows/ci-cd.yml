@@ -1,0 +1,309 @@
+name: DMARC Analyzer CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  AZURE_WEBAPP_NAME: dmarc-analyzer
+  AZURE_RESOURCE_GROUP: rg-dmarc-analyzer
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11']
+
+    services:
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.11.1
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: false
+          ES_JAVA_OPTS: -Xms512m -Xmx512m
+        ports:
+          - 9200:9200
+        options: >-
+          --health-cmd "curl -f http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=30s"
+          --health-interval 30s
+          --health-timeout 10s
+          --health-retries 5
+
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r api/requirements.txt
+        pip install pytest pytest-flask pytest-cov flake8 black mypy safety bandit
+
+    - name: Code quality checks
+      run: |
+        # Format check
+        black --check api/
+
+        # Lint check
+        flake8 api/ --max-line-length=88 --extend-ignore=E203,W503
+
+        # Type checking
+        mypy api/ --ignore-missing-imports
+
+        # Security checks
+        safety check
+        bandit -r api/ -f json -o bandit-report.json || true
+
+    - name: Wait for services
+      run: |
+        # Wait for Elasticsearch
+        for i in {1..60}; do
+          if curl -f http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s; then
+            echo "Elasticsearch is ready"
+            break
+          fi
+          echo "Waiting for Elasticsearch... ($i/60)"
+          sleep 2
+        done
+
+        # Wait for Redis
+        for i in {1..30}; do
+          if redis-cli -h localhost ping; then
+            echo "Redis is ready"
+            break
+          fi
+          echo "Waiting for Redis... ($i/30)"
+          sleep 1
+        done
+
+    - name: Run tests
+      env:
+        ELASTICSEARCH_HOST: localhost
+        REDIS_HOST: localhost
+        FLASK_ENV: testing
+      run: |
+        cd api
+        pytest tests/ -v --cov=. --cov-report=xml --cov-report=html
+      continue-on-error: false
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results-python-${{ matrix.python-version }}
+        path: |
+          api/htmlcov/
+          api/coverage.xml
+          bandit-report.json
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  build-and-push:
+    name: Build and Push Images
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      matrix:
+        service: [api]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./${{ matrix.service }}
+        file: ./${{ matrix.service }}/Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64,linux/arm64
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Deploy to Azure Container Instances
+      uses: azure/aci-deploy@v1
+      with:
+        resource-group: ${{ env.AZURE_RESOURCE_GROUP }}-staging
+        dns-name-label: dmarc-analyzer-staging-${{ github.sha }}
+        image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-api:develop
+        name: dmarc-analyzer-staging
+        location: eastus
+        ports: 5000
+        environment-variables: |
+          FLASK_ENV=staging
+          LOG_LEVEL=INFO
+        secure-environment-variables: |
+          ELASTICSEARCH_HOST=${{ secrets.STAGING_ELASTICSEARCH_HOST }}
+          REDIS_HOST=${{ secrets.STAGING_REDIS_HOST }}
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Deploy Infrastructure
+      run: |
+        az deployment group create \
+          --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+          --template-file infra/main.bicep \
+          --parameters \
+            appName=${{ env.AZURE_WEBAPP_NAME }} \
+            environment=production \
+            containerImage="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-api:latest"
+
+    - name: Deploy Application
+      uses: azure/webapps-deploy@v2
+      with:
+        app-name: ${{ env.AZURE_WEBAPP_NAME }}
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-api:latest
+
+  performance-test:
+    name: Performance Testing
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/develop'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run k6 Performance Tests
+      uses: grafana/k6-action@v0.3.1
+      with:
+        filename: tests/performance/api-load-test.js
+      env:
+        API_BASE_URL: https://dmarc-analyzer-staging-${{ github.sha }}.eastus.azurecontainer.io
+
+    - name: Upload performance results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: performance-results
+        path: k6-results.json
+
+  notify:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production, performance-test]
+    if: always()
+
+    steps:
+    - name: Notify Slack
+      uses: 8398a7/action-slack@v3
+      if: always()
+      with:
+        status: ${{ job.status }}
+        text: |
+          DMARC Analyzer Pipeline Status: ${{ job.status }}
+          Branch: ${{ github.ref }}
+          Commit: ${{ github.sha }}
+          Run: ${{ github.run_number }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

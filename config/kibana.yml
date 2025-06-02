@@ -1,0 +1,30 @@
+# Kibana Configuration
+server.name: "dmarc-kibana"
+server.host: "0.0.0.0"
+server.port: 5601
+
+# Elasticsearch connection
+elasticsearch.hosts: ["http://elasticsearch:9200"]
+elasticsearch.username: "kibana_system"
+elasticsearch.password: "kibana123"
+
+# Security settings (disabled for development)
+xpack.security.enabled: false
+xpack.encryptedSavedObjects.encryptionKey: "dmarc-analyzer-encryption-key-32-chars"
+
+# Monitoring
+monitoring.kibana.collection.enabled: false
+
+# Performance settings
+server.maxPayload: 1048576
+elasticsearch.requestTimeout: 30000
+elasticsearch.pingTimeout: 1500
+
+# Dashboard settings
+kibana.defaultAppId: "discover"
+
+# Search settings
+data.search.aggs.shardDelay.enabled: false
+
+# UI settings
+i18n.locale: "en"
