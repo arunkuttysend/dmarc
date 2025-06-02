@@ -1,0 +1,6 @@
+# config/elasticsearch.yml
+cluster.name: "dmarc-cluster"
+network.host: 0.0.0.0
+http.port: 9200
+discovery.type: single-node
+xpack.security.enabled: false
